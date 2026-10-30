@@ -1,0 +1,46 @@
+name: Build patched Moonlight APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['*.patch', '.github/workflows/build.yml']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (patch)
+        uses: actions/checkout@v4
+        with:
+          path: fix
+
+      - name: Checkout upstream Moonlight
+        uses: actions/checkout@v4
+        with:
+          repository: moonlight-stream/moonlight-android
+          ref: b48494cb96bff23d8886c4775cc4f39a1075495d
+          submodules: recursive
+          path: moonlight
+
+      - name: Apply patch
+        working-directory: moonlight
+        run: git apply --verbose ../fix/android14-tv-lowlatency.patch
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform + NDK
+        run: sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865" || sdkmanager "ndk;29.0.14206865"
+
+      - name: Build (nonRoot debug, installs next to the official app)
+        working-directory: moonlight
+        run: ./gradlew --no-daemon assembleNonRootDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonlight-android14-tv-fix
+          path: moonlight/app/build/outputs/apk/nonRoot/debug/*.apk
