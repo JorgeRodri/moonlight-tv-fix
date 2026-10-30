@@ -1,0 +1,152 @@
+diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+index 5d4e44e..07e5767 100644
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+@@ -637,13 +637,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+         adaptivePlayback = MediaCodecHelper.decoderSupportsAdaptivePlayback(selectedDecoderInfo, mimeType);
+         fusedIdrFrame = MediaCodecHelper.decoderSupportsFusedIdrFrame(selectedDecoderInfo, mimeType);
+ 
++        String llMode = prefs.decoderLowLatencyMode;
++        MediaCodecHelper.skipAndroidLowLatency = "no_android".equals(llMode);
++        MediaCodecHelper.skipVendorLowLatency = "no_vendor".equals(llMode);
++        boolean llOff = "off".equals(llMode);
++        LimeLog.info("Decoder low-latency mode: "+llMode+" (decoder: "+selectedDecoderInfo.getName()+")");
++
+         for (int tryNumber = 0;; tryNumber++) {
+             LimeLog.info("Decoder configuration try: "+tryNumber);
+ 
+             MediaFormat mediaFormat = createBaseMediaFormat(mimeType);
+ 
+             // This will try low latency options until we find one that works (or we give up).
+-            boolean newFormat = MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, tryNumber);
++            boolean newFormat = !llOff &&
++                    MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, tryNumber);
+ 
+             // Throw the underlying codec exception on the last attempt if the caller requested it
+             if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, !newFormat && throwOnCodecError)) {
+diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+index 24d1f01..3568298 100644
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
+@@ -492,13 +492,19 @@ public class MediaCodecHelper {
+                 !isAdreno620;
+     }
+ 
++    // Android 14 TV workaround: user-selectable low-latency override.
++    // Some Android 14 TV firmwares (Amlogic/MediaTek) decode frames but never present them
++    // when low-latency decoder modes are requested, resulting in a black or frozen screen.
++    public static boolean skipAndroidLowLatency = false; // KEY_LOW_LATENCY ("low-latency")
++    public static boolean skipVendorLowLatency = false;  // vdec-lowlatency + vendor.* extensions
++
+     public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, int tryNumber) {
+         // Options here should be tried in the order of most to least risky. The decoder will use
+         // the first MediaFormat that doesn't fail in configure().
+ 
+         boolean setNewOption = false;
+ 
+-        if (tryNumber < 1) {
++        if (tryNumber < 1 && !skipAndroidLowLatency) {
+             // Official Android 11+ low latency option (KEY_LOW_LATENCY).
+             videoFormat.setInteger("low-latency", 1);
+             setNewOption = true;
+@@ -510,7 +516,7 @@ public class MediaCodecHelper {
+             }
+         }
+ 
+-        if (tryNumber < 2 &&
++        if (tryNumber < 2 && !skipVendorLowLatency &&
+                 (!Build.MANUFACTURER.equalsIgnoreCase("xiaomi") || Build.VERSION.SDK_INT > Build.VERSION_CODES.M)) {
+             // MediaTek decoders don't use vendor-defined keys for low latency mode. Instead, they have a modified
+             // version of AOSP's ACodec.cpp which supports the "vdec-lowlatency" option. This option is passed down
+@@ -546,7 +552,7 @@ public class MediaCodecHelper {
+         //
+         // MediaCodec vendor extension support was introduced in Android 8.0:
+         // https://cs.android.com/android/_/android/platform/frameworks/av/+/01c10f8cdcd58d1e7025f426a72e6e75ba5d7fc2
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !skipVendorLowLatency) {
+             // Try vendor-specific low latency options
+             //
+             // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
+diff --git a/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java b/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
+index 8ed01e3..f843974 100644
+--- a/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
++++ b/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
+@@ -47,6 +47,7 @@ public class PreferenceConfiguration {
+     private static final String SHOW_GUIDE_BUTTON_PREF_STRING = "checkbox_show_guide_button";
+     private static final String LEGACY_DISABLE_FRAME_DROP_PREF_STRING = "checkbox_disable_frame_drop";
+     private static final String ENABLE_HDR_PREF_STRING = "checkbox_enable_hdr";
++    private static final String DECODER_LOW_LATENCY_PREF_STRING = "list_decoder_low_latency";
+     private static final String ENABLE_PIP_PREF_STRING = "checkbox_enable_pip";
+     private static final String ENABLE_PERF_OVERLAY_STRING = "checkbox_enable_perf_overlay";
+     private static final String BIND_ALL_USB_STRING = "checkbox_usb_bind_all";
+@@ -134,6 +135,7 @@ public class PreferenceConfiguration {
+     public boolean onlyL3R3;
+     public boolean showGuideButton;
+     public boolean enableHdr;
++    public String decoderLowLatencyMode;
+     public boolean enablePip;
+     public boolean enablePerfOverlay;
+     public boolean enableLatencyToast;
+@@ -583,6 +585,7 @@ public class PreferenceConfiguration {
+         config.showGuideButton = prefs.getBoolean(SHOW_GUIDE_BUTTON_PREF_STRING, SHOW_GUIDE_BUTTON_DEFAULT);
+         config.enableHdr = prefs.getBoolean(ENABLE_HDR_PREF_STRING, DEFAULT_ENABLE_HDR) && !isShieldAtvFirmwareWithBrokenHdr();
+         config.enablePip = prefs.getBoolean(ENABLE_PIP_PREF_STRING, DEFAULT_ENABLE_PIP);
++        config.decoderLowLatencyMode = prefs.getString(DECODER_LOW_LATENCY_PREF_STRING, "default");
+         config.enablePerfOverlay = prefs.getBoolean(ENABLE_PERF_OVERLAY_STRING, DEFAULT_ENABLE_PERF_OVERLAY);
+         config.bindAllUsb = prefs.getBoolean(BIND_ALL_USB_STRING, DEFAULT_BIND_ALL_USB);
+         config.mouseEmulation = prefs.getBoolean(MOUSE_EMULATION_STRING, DEFAULT_MOUSE_EMULATION);
+diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
+index 00a68f4..ed27eec 100644
+--- a/app/src/main/res/values/arrays.xml
++++ b/app/src/main/res/values/arrays.xml
+@@ -127,6 +127,19 @@
+         <item>smoothness</item>
+     </string-array>
+ 
++    <string-array name="decoder_low_latency_names">
++        <item>Default (all low-latency options)</item>
++        <item>Skip Android KEY_LOW_LATENCY</item>
++        <item>Skip vendor/MediaTek/Amlogic options</item>
++        <item>Off (no low-latency options)</item>
++    </string-array>
++    <string-array name="decoder_low_latency_values" translatable="false">
++        <item>default</item>
++        <item>no_android</item>
++        <item>no_vendor</item>
++        <item>off</item>
++    </string-array>
++
+     <string-array name="analog_scrolling_names">
+         <item>@string/analogscroll_none</item>
+         <item>@string/analogscroll_right</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index b20e8be..2f78198 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -292,6 +292,8 @@
+     <string name="videoformat_h264always">Prefer H.264</string>
+ 
+     <string name="title_frame_pacing">Video frame pacing</string>
++    <string name="title_decoder_low_latency">Decoder low-latency mode (Android 14 TV fix)</string>
++    <string name="summary_decoder_low_latency">Change this if you get audio but a black or frozen screen after an Android 14 update</string>
+     <string name="summary_frame_pacing">Specify how to balance video latency and smoothness</string>
+     <string name="pacing_latency">Prefer lowest latency</string>
+     <string name="pacing_balanced">Balanced</string>
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 5b09082..1c69cd6 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -36,6 +36,13 @@
+             android:entryValues="@array/video_frame_pacing_values"
+             android:summary="@string/summary_frame_pacing"
+             android:defaultValue="latency" />
++        <ListPreference
++            android:key="list_decoder_low_latency"
++            android:title="@string/title_decoder_low_latency"
++            android:entries="@array/decoder_low_latency_names"
++            android:entryValues="@array/decoder_low_latency_values"
++            android:summary="@string/summary_decoder_low_latency"
++            android:defaultValue="default" />
+         <CheckBoxPreference
+             android:key="checkbox_stretch_video"
+             android:title="@string/title_checkbox_stretch_video"
