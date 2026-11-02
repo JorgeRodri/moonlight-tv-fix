@@ -1,8 +1,212 @@
+diff --git a/app/src/main/java/com/limelight/Game.java b/app/src/main/java/com/limelight/Game.java
+index 8d369b3..fb3c15c 100644
+--- a/app/src/main/java/com/limelight/Game.java
++++ b/app/src/main/java/com/limelight/Game.java
+@@ -52,6 +52,7 @@ import android.content.pm.PackageManager;
+ import android.content.res.Configuration;
+ import android.graphics.Point;
+ import android.graphics.Rect;
++import android.graphics.SurfaceTexture;
+ import android.hardware.input.InputManager;
+ import android.media.AudioManager;
+ import android.net.ConnectivityManager;
+@@ -69,6 +70,7 @@ import android.view.MotionEvent;
+ import android.view.Surface;
+ import android.view.SurfaceHolder;
+ import android.view.View;
++import android.view.TextureView;
+ import android.view.View.OnGenericMotionListener;
+ import android.view.View.OnSystemUiVisibilityChangeListener;
+ import android.view.View.OnTouchListener;
+@@ -137,6 +139,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+     private boolean waitingForAllModifiersUp = false;
+     private int specialKeyCode = KeyEvent.KEYCODE_UNKNOWN;
+     private StreamView streamView;
++    // Android 14 TV workaround: optional TextureView output (GPU composition instead of HW overlay)
++    private TextureView textureView;
++    private Surface textureSurface;
++    private boolean useTextureView;
+     private long lastAbsTouchUpTime = 0;
+     private long lastAbsTouchDownTime = 0;
+     private float lastAbsTouchUpX, lastAbsTouchUpY;
+@@ -338,6 +344,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+         // Initialize the MediaCodec helper before creating the decoder
+         GlPreferences glPrefs = GlPreferences.readPreferences(this);
+         MediaCodecHelper.initialize(this, glPrefs.glRenderer);
++        MediaCodecHelper.forceSoftwareDecoder = prefConfig.forceSoftwareDecoder;
++        useTextureView = "texture".equals(prefConfig.videoOutputPath);
++        LimeLog.info("Video output path: "+prefConfig.videoOutputPath+", force SW decoder: "+prefConfig.forceSoftwareDecoder+", display mode switch: "+!prefConfig.disableDisplayModeSwitch);
+ 
+         // Check if the user has enabled HDR
+         boolean willStreamHdr = false;
+@@ -533,6 +542,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+ 
+         // The connection will be started when the surface gets created
+         streamView.getHolder().addCallback(this);
++
++        if (useTextureView) {
++            setupTextureView();
++        }
+     }
+ 
+     private void setPreferredOrientationForCurrentDisplay() {
+@@ -887,7 +900,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+                 // If we only changed refresh rate and we're on an OS that supports Surface.setFrameRate()
+                 // use that instead of using preferredDisplayModeId to avoid the possibility of triggering
+                 // bugs that can cause the system to switch from 4K60 to 4K24 on Chromecast 4K.
+-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
++                if (prefConfig.disableDisplayModeSwitch) {
++                    LimeLog.info("Display mode switching disabled by user");
++                }
++                else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                         display.getMode().getPhysicalWidth() != bestMode.getPhysicalWidth() ||
+                         display.getMode().getPhysicalHeight() != bestMode.getPhysicalHeight()) {
+                     // Apply the display mode change
+@@ -2502,12 +2518,96 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+         controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
+     }
+ 
++    private void setupTextureView() {
++        // Draw video into a TextureView placed directly above the StreamView. The decoder then
++        // renders into a GL texture that is composited by the GPU like normal UI, bypassing the
++        // hardware video overlay plane that some Android 14 TV firmwares fail to show.
++        // StreamView stays in place (behind) so input handling keeps working unchanged.
++        final FrameLayout parent = (FrameLayout) streamView.getParent();
++        textureView = new TextureView(this);
++        textureView.setFocusable(false);
++        textureView.setClickable(false);
++        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
++                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
++                android.view.Gravity.CENTER);
++        parent.addView(textureView, parent.indexOfChild(streamView) + 1, lp);
++
++        // Keep the TextureView the same size/position as the aspect-ratio-corrected StreamView
++        streamView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
++            @Override
++            public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
++                FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) textureView.getLayoutParams();
++                if (p.width != (r - l) || p.height != (b - t)) {
++                    p.width = r - l;
++                    p.height = b - t;
++                    p.gravity = android.view.Gravity.CENTER;
++                    textureView.setLayoutParams(p);
++                }
++            }
++        });
++
++        textureView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
++            @Override
++            public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
++                LimeLog.info("TextureView surface available: "+width+"x"+height);
++                textureSurface = new Surface(st);
++                maybeStartConnection();
++            }
++
++            @Override
++            public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {}
++
++            @Override
++            public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
++                if (attemptedConnection) {
++                    decoderRenderer.prepareForStop();
++                    if (connected) {
++                        stopConnection();
++                    }
++                }
++                return true;
++            }
++
++            @Override
++            public void onSurfaceTextureUpdated(SurfaceTexture st) {}
++        });
++    }
++
++    private boolean streamSurfaceReady = false;
++
++    private void maybeStartConnection() {
++        if (attemptedConnection || !streamSurfaceReady) {
++            return;
++        }
++        if (useTextureView && textureSurface == null) {
++            return;
++        }
++
++        attemptedConnection = true;
++
++        // Update GameManager state to indicate we're "loading" while connecting
++        UiHelper.notifyStreamConnecting(Game.this);
++
++        if (useTextureView) {
++            decoderRenderer.setRenderSurface(textureSurface);
++        }
++        decoderRenderer.setRenderTarget(streamView.getHolder());
++        conn.start(new AndroidAudioRenderer(Game.this, prefConfig.enableAudioFx),
++                decoderRenderer, Game.this);
++    }
++
+     @Override
+     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+         if (!surfaceCreated) {
+             throw new IllegalStateException("Surface changed before creation!");
+         }
+ 
++        streamSurfaceReady = true;
++        if (useTextureView) {
++            maybeStartConnection();
++            return;
++        }
++
+         if (!attemptedConnection) {
+             attemptedConnection = true;
+ 
+@@ -2542,7 +2642,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
+         }
+ 
+         // Tell the OS about our frame rate to allow it to adapt the display refresh rate appropriately
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++        if (prefConfig.disableDisplayModeSwitch) {
++            LimeLog.info("Skipping Surface.setFrameRate() (display mode switching disabled)");
++        }
++        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+             // We want to change frame rate even if it's not seamless, since prepareDisplayForRendering()
+             // will not set the display mode on S+ if it only differs by the refresh rate. It depends
+             // on us to trigger the frame rate switch here.
 diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
-index 5d4e44e..07e5767 100644
+index 5d4e44e..166f96a 100644
 --- a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
 +++ b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
-@@ -637,13 +637,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+@@ -33,6 +33,7 @@ import android.os.Handler;
+ import android.os.HandlerThread;
+ import android.os.Process;
+ import android.os.SystemClock;
++import android.view.Surface;
+ import android.util.Range;
+ import android.view.Choreographer;
+ import android.view.SurfaceHolder;
+@@ -269,6 +270,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+         return decoderInfo;
+     }
+ 
++    private Surface renderSurface;
++
++    // Android 14 TV workaround: render into an explicit Surface (e.g. from a TextureView)
++    public void setRenderSurface(Surface surface) {
++        this.renderSurface = surface;
++    }
++
+     public void setRenderTarget(SurfaceHolder renderTarget) {
+         this.renderTarget = renderTarget;
+     }
+@@ -516,7 +524,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
+ 
+         LimeLog.info("Configuring with format: "+format);
+ 
+-        videoDecoder.configure(format, renderTarget.getSurface(), null, 0);
++        videoDecoder.configure(format, renderSurface != null ? renderSurface : renderTarget.getSurface(), null, 0);
+ 
+         configuredFormat = format;
+ 
+@@ -637,13 +645,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
          adaptivePlayback = MediaCodecHelper.decoderSupportsAdaptivePlayback(selectedDecoderInfo, mimeType);
          fusedIdrFrame = MediaCodecHelper.decoderSupportsFusedIdrFrame(selectedDecoderInfo, mimeType);
  
@@ -25,7 +229,7 @@ index 5d4e44e..07e5767 100644
              // Throw the underlying codec exception on the last attempt if the caller requested it
              if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, !newFormat && throwOnCodecError)) {
 diff --git a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
-index 24d1f01..3568298 100644
+index 24d1f01..2dc32a2 100644
 --- a/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
 +++ b/app/src/main/java/com/limelight/binding/video/MediaCodecHelper.java
 @@ -492,13 +492,19 @@ public class MediaCodecHelper {
@@ -67,8 +271,45 @@ index 24d1f01..3568298 100644
              // Try vendor-specific low latency options
              //
              // NOTE: Update knownVendorLowLatencyOptions if you modify this code!
+@@ -876,7 +882,36 @@ public class MediaCodecHelper {
+         return null;
+     }
+     
++    // Android 14 TV workaround (diagnostic): use the platform software decoder instead of the
++    // hardware one, to tell decoder bugs apart from display/composition bugs.
++    public static boolean forceSoftwareDecoder = false;
++
++    private static MediaCodecInfo findSoftwareDecoder(String mimeType) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
++            return null;
++        }
++        for (MediaCodecInfo codecInfo : getMediaCodecList()) {
++            if (codecInfo.isEncoder() || codecInfo.isAlias() || !codecInfo.isSoftwareOnly()) {
++                continue;
++            }
++            for (String mime : codecInfo.getSupportedTypes()) {
++                if (mime.equalsIgnoreCase(mimeType)) {
++                    LimeLog.info("Forcing software decoder: "+codecInfo.getName());
++                    return codecInfo;
++                }
++            }
++        }
++        return null;
++    }
++
+     public static MediaCodecInfo findProbableSafeDecoder(String mimeType, int requiredProfile) {
++        if (forceSoftwareDecoder) {
++            MediaCodecInfo sw = findSoftwareDecoder(mimeType);
++            if (sw != null) {
++                return sw;
++            }
++        }
++
+         // First look for a preferred decoder by name
+         MediaCodecInfo info = findPreferredDecoder();
+         if (info != null) {
 diff --git a/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java b/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
-index 8ed01e3..f843974 100644
+index 8ed01e3..44dc410 100644
 --- a/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
 +++ b/app/src/main/java/com/limelight/preferences/PreferenceConfiguration.java
 @@ -47,6 +47,7 @@ public class PreferenceConfiguration {
@@ -79,27 +320,33 @@ index 8ed01e3..f843974 100644
      private static final String ENABLE_PIP_PREF_STRING = "checkbox_enable_pip";
      private static final String ENABLE_PERF_OVERLAY_STRING = "checkbox_enable_perf_overlay";
      private static final String BIND_ALL_USB_STRING = "checkbox_usb_bind_all";
-@@ -134,6 +135,7 @@ public class PreferenceConfiguration {
+@@ -134,6 +135,10 @@ public class PreferenceConfiguration {
      public boolean onlyL3R3;
      public boolean showGuideButton;
      public boolean enableHdr;
 +    public String decoderLowLatencyMode;
++    public String videoOutputPath;
++    public boolean disableDisplayModeSwitch;
++    public boolean forceSoftwareDecoder;
      public boolean enablePip;
      public boolean enablePerfOverlay;
      public boolean enableLatencyToast;
-@@ -583,6 +585,7 @@ public class PreferenceConfiguration {
+@@ -583,6 +588,10 @@ public class PreferenceConfiguration {
          config.showGuideButton = prefs.getBoolean(SHOW_GUIDE_BUTTON_PREF_STRING, SHOW_GUIDE_BUTTON_DEFAULT);
          config.enableHdr = prefs.getBoolean(ENABLE_HDR_PREF_STRING, DEFAULT_ENABLE_HDR) && !isShieldAtvFirmwareWithBrokenHdr();
          config.enablePip = prefs.getBoolean(ENABLE_PIP_PREF_STRING, DEFAULT_ENABLE_PIP);
 +        config.decoderLowLatencyMode = prefs.getString(DECODER_LOW_LATENCY_PREF_STRING, "default");
++        config.videoOutputPath = prefs.getString("list_video_output_path", "surface");
++        config.disableDisplayModeSwitch = prefs.getBoolean("checkbox_disable_display_mode_switch", false);
++        config.forceSoftwareDecoder = prefs.getBoolean("checkbox_force_software_decoder", false);
          config.enablePerfOverlay = prefs.getBoolean(ENABLE_PERF_OVERLAY_STRING, DEFAULT_ENABLE_PERF_OVERLAY);
          config.bindAllUsb = prefs.getBoolean(BIND_ALL_USB_STRING, DEFAULT_BIND_ALL_USB);
          config.mouseEmulation = prefs.getBoolean(MOUSE_EMULATION_STRING, DEFAULT_MOUSE_EMULATION);
 diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
-index 00a68f4..ed27eec 100644
+index 00a68f4..27e921f 100644
 --- a/app/src/main/res/values/arrays.xml
 +++ b/app/src/main/res/values/arrays.xml
-@@ -127,6 +127,19 @@
+@@ -127,6 +127,28 @@
          <item>smoothness</item>
      </string-array>
  
@@ -114,6 +361,15 @@ index 00a68f4..ed27eec 100644
 +        <item>no_android</item>
 +        <item>no_vendor</item>
 +        <item>off</item>
++    </string-array>
++
++    <string-array name="video_output_path_names">
++        <item>SurfaceView (default, HW overlay)</item>
++        <item>TextureView (GPU composition)</item>
++    </string-array>
++    <string-array name="video_output_path_values" translatable="false">
++        <item>surface</item>
++        <item>texture</item>
 +    </string-array>
 +
      <string-array name="analog_scrolling_names">
@@ -133,10 +389,10 @@ index b20e8be..2f78198 100644
      <string name="pacing_latency">Prefer lowest latency</string>
      <string name="pacing_balanced">Balanced</string>
 diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
-index 5b09082..1c69cd6 100644
+index 5b09082..dd26ce0 100644
 --- a/app/src/main/res/xml/preferences.xml
 +++ b/app/src/main/res/xml/preferences.xml
-@@ -36,6 +36,13 @@
+@@ -36,6 +36,30 @@
              android:entryValues="@array/video_frame_pacing_values"
              android:summary="@string/summary_frame_pacing"
              android:defaultValue="latency" />
@@ -147,6 +403,23 @@ index 5b09082..1c69cd6 100644
 +            android:entryValues="@array/decoder_low_latency_values"
 +            android:summary="@string/summary_decoder_low_latency"
 +            android:defaultValue="default" />
++        <ListPreference
++            android:key="list_video_output_path"
++            android:title="Video output path (Android 14 TV fix)"
++            android:entries="@array/video_output_path_names"
++            android:entryValues="@array/video_output_path_values"
++            android:summary="Try TextureView if you get audio and normal stats but a black screen"
++            android:defaultValue="surface" />
++        <CheckBoxPreference
++            android:key="checkbox_disable_display_mode_switch"
++            android:title="Disable display mode switching (Android 14 TV fix)"
++            android:summary="Don't change the TV refresh rate or resolution when a stream starts"
++            android:defaultValue="false" />
++        <CheckBoxPreference
++            android:key="checkbox_force_software_decoder"
++            android:title="Force software decoder (diagnostic)"
++            android:summary="Slow, for testing only: shows whether the hardware decoder or the display path is broken"
++            android:defaultValue="false" />
          <CheckBoxPreference
              android:key="checkbox_stretch_video"
              android:title="@string/title_checkbox_stretch_video"
